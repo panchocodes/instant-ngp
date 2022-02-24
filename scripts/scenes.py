@@ -42,14 +42,14 @@ def nerf_real_360(name, frameidx):
 	}
 scenes_nerf = {
 	"fox"         : ours_real_converted("fox/", frameidx=0),
-	"lego"      : nerf_synthetic("lego", frameidx=52),
-	"drums"     : nerf_synthetic("drums", frameidx=52),
-	"ship"      : nerf_synthetic("ship", frameidx=52),
-	"mic"       : nerf_synthetic("mic", frameidx=52),
-	"ficus"     : nerf_synthetic("ficus", frameidx=52),
-	"chair"     : nerf_synthetic("chair", frameidx=52),
-	"hotdog"    : nerf_synthetic("hotdog", frameidx=52),
-	"materials" : nerf_synthetic("materials", frameidx=52),
+	"lego"      : ours_real_converted("lego", frameidx=52),
+	"drums"     : ours_real_converted("drums", frameidx=52),
+	"ship"      : ours_real_converted("ship", frameidx=52),
+	"mic"       : ours_real_converted("mic", frameidx=52),
+	"ficus"     : ours_real_converted("ficus", frameidx=52),
+	"chair"     : ours_real_converted("chair", frameidx=52),
+	"hotdog"    : ours_real_converted("hotdog", frameidx=52),
+	"materials" : ours_real_converted("materials", frameidx=52),
 
 	# nerf real 360
 	"pinecone" : nerf_real_360("pinecone", frameidx=0),
@@ -86,6 +86,8 @@ def ours_image(name,infolder=True):
 
 scenes_image = {
 	"albert"        : ours_image("albert", False),
+	"out"        : ours_image("out", False),
+	"tokyo"        : ours_image("bigtokyo", False),
 }
 
 def ours_volume(name, ds):
