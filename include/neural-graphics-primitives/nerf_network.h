@@ -139,6 +139,18 @@ __global__ void extract_density_gradient(
 }
 
 template <typename T>
+__global__ void add_density_gradient(
+	const uint32_t n_elements,
+	const T* __restrict__ rgbd,
+	T* __restrict__ density
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	density[i] += rgbd[i*4+3];
+}
+
+template <typename T>
 __global__ void extract_dir_gradient(
 	const uint32_t n_elements,
 	const uint32_t offset,
@@ -161,16 +173,20 @@ class NerfNetwork : public tcnn::Network<float, T> {
 public:
 	using json = nlohmann::json;
 
-	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network) : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset} {
+	NerfNetwork(uint32_t n_pos_dims, uint32_t n_dir_dims, uint32_t n_extra_dims, uint32_t dir_offset, const json& pos_encoding, const json& dir_encoding, const json& density_network, const json& rgb_network) : m_n_pos_dims{n_pos_dims}, m_n_dir_dims{n_dir_dims}, m_dir_offset{dir_offset}, m_n_extra_dims{n_extra_dims} {
 		m_pos_encoding.reset(tcnn::create_encoding<T>(n_pos_dims, pos_encoding, density_network.contains("otype") && (tcnn::equals_case_insensitive(density_network["otype"], "FullyFusedMLP") || tcnn::equals_case_insensitive(density_network["otype"], "MegakernelMLP")) ? 16u : 8u));
 		uint32_t rgb_alignment = rgb_network.contains("otype") && (tcnn::equals_case_insensitive(rgb_network["otype"], "FullyFusedMLP") || tcnn::equals_case_insensitive(rgb_network["otype"], "MegakernelMLP")) ? 16u : 8u;
-		m_dir_encoding.reset(tcnn::create_encoding<T>(n_dir_dims, dir_encoding, rgb_alignment));
+		m_dir_encoding.reset(tcnn::create_encoding<T>(m_n_dir_dims + m_n_extra_dims, dir_encoding, rgb_alignment));
 
 		// Assume that row-major/SoA operation will be faster, so use it if supported.
 		// This assumption is valid mostly for the (hash-)grid encoding, which is
 		// typically used for the position.
 		if (m_pos_encoding->supports_output_layout(tcnn::RM)) {
 			m_pos_encoding->set_output_layout(tcnn::RM);
+		}
+
+		if (m_dir_encoding->supports_output_layout(tcnn::RM)) {
+			m_dir_encoding->set_output_layout(tcnn::RM);
 		}
 
 		json local_density_network_config = density_network;
@@ -203,8 +219,15 @@ public:
 
 		uint32_t batch_size = input.n();
 		tcnn::GPUMatrixDynamic<T> density_network_input{m_pos_encoding->num_encoded_dims(), batch_size, stream, m_pos_encoding->output_layout()};
-		tcnn::GPUMatrix<T> density_network_output{m_density_network->padded_output_width(), batch_size, stream};
-		tcnn::GPUMatrix<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream};
+		tcnn::GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->output_layout()};
+
+		tcnn::GPUMatrixDynamic<T> density_network_output;
+		if (m_dir_encoding->output_layout() == tcnn::AoS) {
+			density_network_output = tcnn::GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, tcnn::CM};
+		} else {
+			// If SoA, the density network output is just at the beginning of the RGB network input
+			density_network_output = tcnn::GPUMatrixDynamic<T>{rgb_network_input.data(), m_density_network->padded_output_width(), batch_size, tcnn::RM};
+		}
 		tcnn::GPUMatrix<T> rgb_network_output{m_rgb_network->padded_output_width(), batch_size, stream};
 
 		// Perform directional encoding and density network query in parallel
@@ -223,22 +246,24 @@ public:
 				synced_streams.get(1),
 				batch_size,
 				{input.data() + m_dir_offset, input.m()},
-				{rgb_network_input.data() + m_density_network->padded_output_width(), rgb_network_input.m()},
+				{rgb_network_input.data() + m_density_network->padded_output_width() * (m_dir_encoding->output_layout() == tcnn::SoA ? batch_size : 1), rgb_network_input.m()},
 				nullptr,
 				use_inference_matrices
 			);
 
 			m_density_network->inference_mixed_precision(synced_streams.get(0), density_network_input, density_network_output, use_inference_matrices);
 
-			tcnn::linear_kernel(grab_density_network_output<T>, 0, synced_streams.get(0),
-				density_network_output.n_elements(), density_network_output.m(), rgb_network_input.m() /* stride */, density_network_output.data(), rgb_network_input.data()
-			);
+			if (m_dir_encoding->output_layout() == tcnn::AoS) {
+				tcnn::linear_kernel(grab_density_network_output<T>, 0, synced_streams.get(0),
+					density_network_output.n_elements(), density_network_output.m(), rgb_network_input.m() /* stride */, density_network_output.data(), rgb_network_input.data()
+				);
+			}
 		}
 
 		m_rgb_network->inference_mixed_precision(stream, rgb_network_input, rgb_network_output, use_inference_matrices);
 
 		tcnn::linear_kernel(assemble_rgbd<T>, 0, stream,
-			output.n_elements(), density_network_output.m(), rgb_network_output.m(), density_network_output.data(), rgb_network_output.data(), output.data()
+			output.n_elements(), m_dir_encoding->output_layout() == tcnn::AoS ? density_network_output.m() : 1, rgb_network_output.m(), density_network_output.data(), rgb_network_output.data(), output.data()
 		);
 	}
 
@@ -283,7 +308,7 @@ public:
 		auto forward = std::make_unique<ForwardContext>();
 
 		forward->density_network_input = tcnn::GPUMatrixDynamic<T>{m_pos_encoding->num_encoded_dims(), batch_size, stream, m_pos_encoding->output_layout()};
-		forward->rgb_network_input = tcnn::GPUMatrix<T>{m_rgb_network_input_width, batch_size, stream};
+		forward->rgb_network_input = tcnn::GPUMatrixDynamic<T>{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->output_layout()};
 
 		if (prepare_input_gradients) {
 			forward->pos_encoding_forward_gradient = tcnn::GPUMatrix<float>{m_pos_encoding->num_forward_gradient_dims(), batch_size, stream};
@@ -302,24 +327,32 @@ public:
 			stream,
 			batch_size,
 			{input.data() + m_dir_offset, input.m()},
-			{forward->rgb_network_input.data() + m_density_network->padded_output_width(), forward->rgb_network_input.m()},
+			{forward->rgb_network_input.data() + m_density_network->padded_output_width() * (m_dir_encoding->output_layout() == tcnn::SoA ? batch_size : 1), forward->rgb_network_input.m()},
 			prepare_input_gradients ? forward->dir_encoding_forward_gradient.data() : nullptr,
 			use_inference_matrices
 		);
 
-		forward->density_network_output = tcnn::GPUMatrix<T>{m_density_network->padded_output_width(), batch_size, stream};
+		if (m_dir_encoding->output_layout() == tcnn::AoS) {
+			forward->density_network_output = tcnn::GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, tcnn::CM};
+		} else {
+			// If SoA, the density network output is just at the beginning of the RGB network input
+			forward->density_network_output = tcnn::GPUMatrixDynamic<T>{forward->rgb_network_input.data(), m_density_network->padded_output_width(), batch_size, tcnn::RM};
+		}
+
 		forward->density_network_ctx = m_density_network->forward(stream, forward->density_network_input, &forward->density_network_output, use_inference_matrices, prepare_input_gradients);
 
-		tcnn::linear_kernel(grab_density_network_output<T>, 0, stream,
-			forward->density_network_output.n_elements(), forward->density_network_output.m(), forward->rgb_network_input.m() /* stride */, forward->density_network_output.data(), forward->rgb_network_input.data()
-		);
+		if (m_dir_encoding->output_layout() == tcnn::AoS) {
+			tcnn::linear_kernel(grab_density_network_output<T>, 0, stream,
+				forward->density_network_output.n_elements(), forward->density_network_output.m(), forward->rgb_network_input.m() /* stride */, forward->density_network_output.data(), forward->rgb_network_input.data()
+			);
+		}
 
 		forward->rgb_network_output = tcnn::GPUMatrix<T>{m_rgb_network->padded_output_width(), batch_size, stream};
 		forward->rgb_network_ctx = m_rgb_network->forward(stream, forward->rgb_network_input, &forward->rgb_network_output, use_inference_matrices, prepare_input_gradients);
 
 		if (output) {
 			tcnn::linear_kernel(assemble_rgbd<T>, 0, stream,
-				output->n_elements(), forward->density_network_output.m(), forward->rgb_network_output.m(), forward->density_network_output.data(), forward->rgb_network_output.data(), output->data()
+				output->n_elements(), m_dir_encoding->output_layout() == tcnn::AoS ? forward->density_network_output.m() : 1, forward->rgb_network_output.m(), forward->density_network_output.data(), forward->rgb_network_output.data(), output->data()
 			);
 		}
 
@@ -351,16 +384,24 @@ public:
 			batch_size*3, dL_drgb.m(), dL_doutput.data(), dL_drgb.data()
 		);
 
-		tcnn::GPUMatrix<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream};
+		tcnn::GPUMatrixDynamic<T> dL_drgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->output_layout()};
 		m_rgb_network->backward(stream, *forward.rgb_network_ctx, forward.rgb_network_input, forward.rgb_network_output, dL_drgb, &dL_drgb_network_input, use_inference_matrices, compute_param_gradients);
 
 		// Backprop through dir encoding if it is trainable or if we need input gradients
 		if (m_dir_encoding->n_params() > 0 || dL_dinput) {
-			tcnn::GPUMatrix<T> dL_ddir_encoding_output{m_dir_encoding->num_encoded_dims(), batch_size, stream};
+			tcnn::GPUMatrixDynamic<T> dL_ddir_encoding_output;
 
-			tcnn::linear_kernel(extract_dir_gradient<T>, 0, stream,
-				dL_ddir_encoding_output.n_elements(), m_density_network->padded_output_width(), dL_ddir_encoding_output.m(), dL_drgb_network_input.m(), dL_drgb_network_input.data(), dL_ddir_encoding_output.data()
-			);
+			if (m_dir_encoding->output_layout() == tcnn::AoS) {
+				dL_ddir_encoding_output = tcnn::GPUMatrixDynamic<T>{m_dir_encoding->num_encoded_dims(), batch_size, stream, tcnn::CM};
+				tcnn::linear_kernel(extract_dir_gradient<T>, 0, stream,
+					dL_ddir_encoding_output.n_elements(), m_density_network->padded_output_width(), dL_ddir_encoding_output.m(), dL_drgb_network_input.m(), dL_drgb_network_input.data(), dL_ddir_encoding_output.data()
+				);
+			} else {
+				dL_ddir_encoding_output = tcnn::GPUMatrixDynamic<T>{
+					dL_drgb_network_input.data() + m_density_network->padded_output_width() * (m_dir_encoding->output_layout() == tcnn::SoA ? batch_size : 1),
+					m_dir_encoding->num_encoded_dims(), batch_size, tcnn::RM
+				};
+			}
 
 			m_dir_encoding->backward(
 				stream,
@@ -372,16 +413,28 @@ public:
 			);
 		}
 
-		tcnn::GPUMatrix<T> dL_ddensity_network_output{m_density_network->padded_output_width(), batch_size, stream};
-		tcnn::linear_kernel(extract_density_gradient<T>, 0, stream,
-			dL_ddensity_network_output.n_elements(),
-			dL_ddensity_network_output.m(),
-			dL_drgb_network_input.m(),
-			dL_doutput.data(),
-			forward.density_network_output.data(),
-			dL_drgb_network_input.data(),
-			dL_ddensity_network_output.data()
-		);
+		tcnn::GPUMatrixDynamic<T> dL_ddensity_network_output;
+		if (m_dir_encoding->output_layout() == tcnn::AoS) {
+			dL_ddensity_network_output = tcnn::GPUMatrixDynamic<T>{m_density_network->padded_output_width(), batch_size, stream, tcnn::CM};
+
+			tcnn::linear_kernel(extract_density_gradient<T>, 0, stream,
+				dL_ddensity_network_output.n_elements(),
+				dL_ddensity_network_output.m(),
+				dL_drgb_network_input.m(),
+				dL_doutput.data(),
+				forward.density_network_output.data(),
+				dL_drgb_network_input.data(),
+				dL_ddensity_network_output.data()
+			);
+		} else {
+			dL_ddensity_network_output = tcnn::GPUMatrixDynamic<T>{dL_drgb_network_input.data(), m_density_network->padded_output_width(), batch_size, tcnn::RM};
+
+			tcnn::linear_kernel(add_density_gradient<T>, 0, stream,
+				batch_size,
+				dL_doutput.data(),
+				dL_ddensity_network_output.data()
+			);
+		}
 
 		tcnn::GPUMatrixDynamic<T> dL_ddensity_network_input;
 		if (m_pos_encoding->n_params() > 0 || dL_dinput) {
@@ -497,6 +550,10 @@ public:
 		return 4;
 	}
 
+	uint32_t n_extra_dims() const {
+		return m_n_extra_dims;
+	}
+
 	uint32_t required_input_alignment() const override {
 		return 1; // No alignment required due to encoding
 	}
@@ -566,13 +623,14 @@ private:
 	uint32_t m_rgb_network_input_width;
 	uint32_t m_n_pos_dims;
 	uint32_t m_n_dir_dims;
+	uint32_t m_n_extra_dims; // extra dimensions are assumed to be part of a compound encoding with dir_dims
 	uint32_t m_dir_offset;
 
 	// // Storage of forward pass data
 	struct ForwardContext : public tcnn::Context {
 		tcnn::GPUMatrixDynamic<T> density_network_input;
-		tcnn::GPUMatrix<T> density_network_output;
-		tcnn::GPUMatrix<T> rgb_network_input;
+		tcnn::GPUMatrixDynamic<T> density_network_output;
+		tcnn::GPUMatrixDynamic<T> rgb_network_input;
 		tcnn::GPUMatrix<T> rgb_network_output;
 		tcnn::GPUMatrix<float> pos_encoding_forward_gradient; // Only needed when computing input gradients
 		tcnn::GPUMatrix<float> dir_encoding_forward_gradient; // Only needed when computing input gradients
